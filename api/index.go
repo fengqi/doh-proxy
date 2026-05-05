@@ -95,7 +95,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	} else if method == http.MethodGet && r.Header.Get("Accept") == dnsJson {
 		getJson(w, r)
 		return
-	} else if method == http.MethodPost && r.Header.Get("Content-Type") == dnsMsg {
+	} else if method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), dnsMsg) {
 		post(w, r)
 		return
 	}
@@ -108,6 +108,8 @@ func get(w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, api, nil)
 	if err != nil {
 		log.Printf("new request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
 
 	req.Header.Set("Accept", dnsMsg)
@@ -116,10 +118,12 @@ func get(w http.ResponseWriter, r *http.Request) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("do request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
 
 	defer closeResp(resp)
-	io.Copy(w, resp.Body)
+	relayResponse(w, resp)
 }
 
 func getJson(w http.ResponseWriter, r *http.Request) {
@@ -127,27 +131,38 @@ func getJson(w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequest(http.MethodGet, api, nil)
 	if err != nil {
 		log.Printf("new request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
 
-	req.Header.Set("accept", "application/dns-json")
+	req.Header.Set("Accept", dnsJson)
 	req.Header.Set("X-Forwarded-For", realIp(r))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("do request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
 
 	defer closeResp(resp)
-	io.Copy(w, resp.Body)
+	relayResponse(w, resp)
 }
 
 func post(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("read request body failed: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, doh, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("new request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
 	req.Header.Set("Accept", dnsMsg)
 	req.Header.Set("Content-Type", dnsMsg)
 	req.Header.Set("X-Forwarded-For", realIp(r))
@@ -155,10 +170,30 @@ func post(w http.ResponseWriter, r *http.Request) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("do request failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
 
 	defer closeResp(resp)
-	io.Copy(w, resp.Body)
+	relayResponse(w, resp)
+}
+
+func relayResponse(w http.ResponseWriter, resp *http.Response) {
+	if resp == nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = dnsMsg
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(resp.StatusCode)
+
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("copy response body failed: %v", err)
+	}
 }
 
 func closeResp(resp *http.Response) {
