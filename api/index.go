@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,9 +26,10 @@ var (
 )
 
 var (
-	path    = "/dns-query"
-	doh     = "https://1.1.1.1/dns-query"
-	dohJson = "https://1.1.1.1/dns-query"
+	path       = "/dns-query"
+	doh        = "https://dns.google/dns-query"
+	dohJson    = "https://dns.google/resolve"
+	defaultECS = ""
 )
 
 func init() {
@@ -39,6 +41,9 @@ func init() {
 	}
 	if env, b := os.LookupEnv("DOH_QUERY_JSON_URL"); b && env != "" {
 		dohJson = env
+	}
+	if env, b := os.LookupEnv("DOH_ECS"); b && env != "" {
+		defaultECS = env
 	}
 
 	maxCidrBlocks := []string{
@@ -58,13 +63,11 @@ func init() {
 	}
 
 	httpClient = &http.Client{
-		Timeout: time.Second * 3,
+		Timeout: time.Second * 5,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				dialer := &net.Dialer{
-					KeepAlive: 60 * time.Second,
-				}
+				dialer := &net.Dialer{KeepAlive: 60 * time.Second}
 				return dialer.DialContext(ctx, network, addr)
 			},
 			MaxIdleConns:        150,
@@ -72,12 +75,6 @@ func init() {
 			MaxConnsPerHost:     100,
 			IdleConnTimeout:     60 * time.Second,
 			ForceAttemptHTTP2:   true,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 2 {
-				return http.ErrUseLastResponse
-			}
-			return nil
 		},
 	}
 }
@@ -92,7 +89,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	if method == http.MethodGet && r.URL.Query().Has("dns") {
 		get(w, r)
 		return
-	} else if method == http.MethodGet && r.Header.Get("Accept") == dnsJson {
+	} else if method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), dnsJson) {
 		getJson(w, r)
 		return
 	} else if method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), dnsMsg) {
@@ -127,8 +124,20 @@ func get(w http.ResponseWriter, r *http.Request) {
 }
 
 func getJson(w http.ResponseWriter, r *http.Request) {
-	api := fmt.Sprintf("%s?%s", dohJson, r.URL.RawQuery)
-	req, err := http.NewRequest(http.MethodGet, api, nil)
+	query := r.URL.Query()
+	if defaultECS != "" && query.Get("edns_client_subnet") == "" {
+		query.Set("edns_client_subnet", defaultECS)
+	}
+
+	api, err := url.Parse(dohJson)
+	if err != nil {
+		log.Printf("parse doh json url failed: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	api.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, api.String(), nil)
 	if err != nil {
 		log.Printf("new request failed: %v", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -204,7 +213,6 @@ func closeResp(resp *http.Response) {
 	}
 }
 
-// https://github.com/tomasen/realip/blob/master/realip.go
 func realIp(r *http.Request) string {
 	xRealIP := r.Header.Get("X-Real-Ip")
 	xForwardedFor := r.Header.Get("X-Forwarded-For")
@@ -216,7 +224,6 @@ func realIp(r *http.Request) string {
 		} else {
 			remoteIP = r.RemoteAddr
 		}
-
 		return remoteIP
 	}
 
@@ -242,6 +249,5 @@ func isPrivateAddress(address string) (bool, error) {
 			return true, nil
 		}
 	}
-
 	return false, nil
 }
